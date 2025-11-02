@@ -42,42 +42,56 @@ to_tensor = transforms.ToTensor()
 to_pil = transforms.ToPILImage()
 
 # =============================
-# 4. Compress and reconstruct each frame (fixed)
+# 4. Compress and reconstruct frames in batches
 # =============================
-print("Compressing and reconstructing frames...")
+print("Compressing and reconstructing frames in batches...")
 
-for frame_file in sorted(os.listdir(frames_dir)):
-    if not frame_file.endswith(".png"):
-        continue
+batch_size = 16  # Adjust depending on VRAM; RTX 5090 can likely handle 16-32+
+frame_files = sorted([f for f in os.listdir(frames_dir) if f.endswith(".png")])
 
-    input_path = os.path.join(frames_dir, frame_file)
-    output_path = os.path.join(compressed_dir, frame_file)
+for i in range(0, len(frame_files), batch_size):
+    batch_files = frame_files[i:i+batch_size]
+    imgs = []
+    orig_sizes = []
 
-    # Load frame
-    img = Image.open(input_path).convert("RGB")
-    x = to_tensor(img).unsqueeze(0).to(device)
+    # Load frames and store original sizes
+    max_h, max_w = 0, 0
+    for frame_file in batch_files:
+        img = Image.open(os.path.join(frames_dir, frame_file)).convert("RGB")
+        x = to_tensor(img)
+        h, w = x.size(1), x.size(2)
+        orig_sizes.append((h, w))
+        max_h = max(max_h, h)
+        max_w = max(max_w, w)
+        imgs.append(x)
 
-    # Pad to multiple of 64
-    h, w = x.size(2), x.size(3)
-    new_h = (h + 63) // 64 * 64
-    new_w = (w + 63) // 64 * 64
-    pad_h = new_h - h
-    pad_w = new_w - w
-    x_padded = F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
+    # Pad frames to multiple of 64 and max size in batch
+    padded_imgs = []
+    for x, (h, w) in zip(imgs, orig_sizes):
+        new_h = (max_h + 63) // 64 * 64
+        new_w = (max_w + 63) // 64 * 64
+        pad_h = new_h - h
+        pad_w = new_w - w
+        x_padded = F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
+        padded_imgs.append(x_padded)
 
-    # Compress and reconstruct
+    batch_tensor = torch.stack(padded_imgs).to(device)
+
+    # Compress and reconstruct batch
     with torch.no_grad():
-        out = model.compress(x_padded)
-        recon = model.decompress(out["strings"], out["shape"])
-        x_hat = recon["x_hat"].clamp(0, 1)
+        compressed_batch = []
+        for x_padded in batch_tensor:
+            out = model.compress(x_padded.unsqueeze(0))
+            recon = model.decompress(out["strings"], out["shape"])
+            x_hat = recon["x_hat"].clamp(0, 1)
+            compressed_batch.append(x_hat.squeeze(0))
 
-    # Crop back to original size
-    x_hat = x_hat[:, :, :h, :w]
+    # Crop to original size and save
+    for x_hat, (h, w), frame_file in zip(compressed_batch, orig_sizes, batch_files):
+        x_hat_cropped = x_hat[:, :h, :w]
+        to_pil(x_hat_cropped.cpu()).save(os.path.join(compressed_dir, frame_file))
 
-    # Save reconstructed frame
-    to_pil(x_hat.squeeze().cpu()).save(output_path)
-
-print("All frames compressed successfully.")
+print("All frames compressed successfully in batches.")
 
 # =============================
 # 5. Recombine frames into video
