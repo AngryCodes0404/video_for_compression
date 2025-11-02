@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
-from compressai.zoo import bmshj2018_hyperprior
+from compressai.zoo import mbt2018_mean, cheng2020_anchor
 
 # =============================
 # 1. Setup
@@ -38,7 +38,7 @@ print("Frames extracted successfully.")
 # 3. Load CompressAI model
 # =============================
 print("Loading compression model...")
-model = bmshj2018_hyperprior(quality=6, pretrained=True).eval().to(device)  # max compression
+model = cheng2020_anchor(quality=6, pretrained=True).eval().to(device)  # max compression
 to_tensor = transforms.ToTensor()
 to_pil = transforms.ToPILImage()
 
