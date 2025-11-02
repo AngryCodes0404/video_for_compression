@@ -13,7 +13,8 @@ input_video = "original.mp4"       # Input video file
 frames_dir = "frames"              # Directory for extracted frames
 compressed_dir = "compressed"      # Directory for reconstructed frames
 output_video = "compressed_video.mp4"
-fps = 30                           # Change if your video has a different framerate
+fps = 30                           # Adjust if your video has a different framerate
+target_width = None                # Set to an int to downscale width, or None to keep original
 
 os.makedirs(frames_dir, exist_ok=True)
 os.makedirs(compressed_dir, exist_ok=True)
@@ -37,7 +38,7 @@ print("Frames extracted successfully.")
 # 3. Load CompressAI model
 # =============================
 print("Loading compression model...")
-model = bmshj2018_hyperprior(quality=3, pretrained=True).eval().to(device)
+model = bmshj2018_hyperprior(quality=1, pretrained=True).eval().to(device)  # max compression
 to_tensor = transforms.ToTensor()
 to_pil = transforms.ToPILImage()
 
@@ -45,7 +46,6 @@ to_pil = transforms.ToPILImage()
 # 4. Compress and reconstruct frames in batches
 # =============================
 print("Compressing and reconstructing frames in batches...")
-
 batch_size = 16  # Adjust depending on VRAM; RTX 5090 can likely handle 16-32+
 frame_files = sorted([f for f in os.listdir(frames_dir) if f.endswith(".png")])
 
@@ -58,6 +58,13 @@ for i in range(0, len(frame_files), batch_size):
     max_h, max_w = 0, 0
     for frame_file in batch_files:
         img = Image.open(os.path.join(frames_dir, frame_file)).convert("RGB")
+
+        # Optional downscale
+        if target_width is not None:
+            w_percent = target_width / img.width
+            new_h = int(img.height * w_percent)
+            img = img.resize((target_width, new_h), Image.LANCZOS)
+
         x = to_tensor(img)
         h, w = x.size(1), x.size(2)
         orig_sizes.append((h, w))
@@ -65,7 +72,7 @@ for i in range(0, len(frame_files), batch_size):
         max_w = max(max_w, w)
         imgs.append(x)
 
-    # Pad frames to multiple of 64 and max size in batch
+    # Pad frames to multiple of 64
     padded_imgs = []
     for x, (h, w) in zip(imgs, orig_sizes):
         new_h = (max_h + 63) // 64 * 64
@@ -97,10 +104,17 @@ print("All frames compressed successfully in batches.")
 # 5. Recombine frames into video
 # =============================
 print("Reassembling compressed frames into video...")
+
+ffmpeg_input = ffmpeg.input(os.path.join(compressed_dir, "frame_%04d.png"), framerate=fps)
+ffmpeg_output_args = {
+    "vcodec": "libx265",
+    "crf": 28,
+    "preset": "slow",
+    "pix_fmt": "yuv420p"
+}
 (
-    ffmpeg
-    .input(os.path.join(compressed_dir, "frame_%04d.png"), framerate=fps)
-    .output(output_video, vcodec="libx264", crf=23)
+    ffmpeg_input
+    .output(output_video, **ffmpeg_output_args)
     .run(overwrite_output=True)
 )
 print(f"✅ Compressed video saved as {output_video}")
@@ -108,7 +122,7 @@ print(f"✅ Compressed video saved as {output_video}")
 # =============================
 # 6. Optional cleanup
 # =============================
-# Uncomment these lines if you want to delete temporary frames
+# Uncomment to remove temporary frames
 # import shutil
 # shutil.rmtree(frames_dir)
 # shutil.rmtree(compressed_dir)
