@@ -38,7 +38,7 @@ print("Frames extracted successfully.")
 # 3. Load CompressAI model
 # =============================
 print("Loading compression model...")
-model = bmshj2018_hyperprior(quality=1, pretrained=True).eval().to(device)  # max compression
+model = bmshj2018_hyperprior(quality=2, pretrained=True).eval().to(device)  # max compression
 to_tensor = transforms.ToTensor()
 to_pil = transforms.ToPILImage()
 
