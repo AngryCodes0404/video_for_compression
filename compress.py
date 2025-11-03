@@ -14,7 +14,7 @@ OUTPUT_VIDEO = "compressed_ssf2020.mp4"
 QUALITY = 3  # from 1 (best quality, largest size) to 6 (lowest quality)
 METRIC = "mse"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
+ 
 # ============================================================
 # Load model
 # ============================================================
