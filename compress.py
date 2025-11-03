@@ -42,7 +42,7 @@ print("Frames extracted successfully.")
 # 3. Load CompressAI model
 # =============================
 print("Loading compression model...")
-model = cheng2020_anchor(quality=6, pretrained=True).eval().to(device)  # Start with max compression
+model = mbt2018_mean(quality=6, pretrained=True).eval().to(device)  # Start with max compression
 to_tensor = transforms.ToTensor()
 to_pil = transforms.ToPILImage()
 
