@@ -1,79 +1,109 @@
-import os
 import torch
 import cv2
+from torchvision.transforms import ToTensor, ToPILImage
+from compressai.zoo import bmshj2018_factorized, ssf2020
+import pickle
 import numpy as np
-from tqdm import tqdm
-from compressai.zoo import ssf2020
-from compressai.utils.bench import compute_bpp
+import os
 
-# ============================================================
-# Configuration
-# ============================================================
-INPUT_VIDEO = "original.mp4"
-OUTPUT_VIDEO = "compressed_ssf2020.mp4"
-QUALITY = 3  # from 1 (best quality, largest size) to 6 (lowest quality)
-METRIC = "mse"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
- 
-# ============================================================
-# Load model
-# ============================================================
-print(f"Loading SSF2020 model (quality={QUALITY}, metric={METRIC})...")
-model = ssf2020(quality=QUALITY, metric=METRIC, pretrained=True).eval().to(DEVICE)
+# Device setup
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# ============================================================
-# Prepare input video
-# ============================================================
-cap = cv2.VideoCapture(INPUT_VIDEO)
+# Load models (adjust quality: 1-8, lower = more compression)
+quality = 4
+i_net = bmshj2018_factorized(quality=quality, pretrained=True).to(device).eval()
+p_net = ssf2020(quality=quality, metric='mse', pretrained=True).to(device).eval()
+
+# Input video path
+input_path = 'original.mp4'
+compressed_path = 'compressed.bin'
+reconstructed_path = 'reconstructed.mp4'
+
+# ====================
+# Encoding Section
+# ====================
+cap = cv2.VideoCapture(input_path)
 if not cap.isOpened():
-    raise IOError(f"Cannot open video file: {INPUT_VIDEO}")
+    raise ValueError("Unable to open video file")
 
-fps = cap.get(cv2.CAP_PROP_FPS)
-width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+# List to hold encoded data: [('I' or 'P', strings, shape)]
+encoded_data = []
 
-os.makedirs("temp_frames", exist_ok=True)
- 
-# ============================================================
-# Frame-by-frame compression
-# ============================================================
-print("Compressing video frame by frame...")
-compressed_frames = []
+# Read first frame (I-frame)
+ret, frame = cap.read()
+if not ret:
+    raise ValueError("Video has no frames")
+frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+x = ToTensor()(frame).unsqueeze(0).to(device)
 
-with tqdm(total=int(cap.get(cv2.CAP_PROP_FRAME_COUNT))) as pbar:
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+with torch.no_grad():
+    compressed = i_net.compress(x)
+encoded_data.append(('I', compressed['strings'], compressed['shape']))
 
-        # Convert to RGB and normalize
-        img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        x = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).float() / 255.0
-        x = x.to(DEVICE)
+# Get reconstructed for next frame
+with torch.no_grad():
+    x_hat = i_net.decompress(compressed['strings'], compressed['shape'])['x_hat'].clip_(0, 1)
 
-        # Compress
-        with torch.no_grad():
-            out_enc = model.compress(x)
-            out_dec = model.decompress(out_enc["strings"], out_enc["shape"])
-        
-        # Decode and save
-        rec_img = out_dec["x_hat"].clamp(0, 1)
-        rec_np = (rec_img.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-        rec_bgr = cv2.cvtColor(rec_np, cv2.COLOR_RGB2BGR)
-        compressed_frames.append(rec_bgr)
-        pbar.update(1)
+# Process remaining frames (P-frames)
+frame_count = 1
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
+    frame_count += 1
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    x = ToTensor()(frame).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        compressed = p_net.compress(x_hat, x)
+    encoded_data.append(('P', compressed['strings'], compressed['shape']))
+
+    # Update x_hat for next
+    with torch.no_grad():
+        x_hat = p_net.decompress(x_hat, compressed['strings'], compressed['shape'])['x_hat'].clip_(0, 1)
+
+# Save compressed data
+with open(compressed_path, 'wb') as f:
+    pickle.dump(encoded_data, f)
+print(f"Compressed bitstream saved to {compressed_path} (size: {os.path.getsize(compressed_path)} bytes)")
 
 cap.release()
 
-# ============================================================
-# Write compressed video
-# ============================================================
-print(f"Writing compressed video to {OUTPUT_VIDEO}...")
-out = cv2.VideoWriter(OUTPUT_VIDEO, fourcc, fps, (width, height))
-for frame in compressed_frames:
-    out.write(frame)
-out.release()
+# ====================
+# Decoding Section
+# ====================
+with open(compressed_path, 'rb') as f:
+    encoded_data = pickle.load(f)
 
-print("✅ Compression complete!")
-print(f"Saved to: {OUTPUT_VIDEO}")
+# Get video properties from original (for output)
+cap = cv2.VideoCapture(input_path)
+fps = cap.get(cv2.CAP_PROP_FPS)
+width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+cap.release()
+
+out = cv2.VideoWriter(reconstructed_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
+
+to_pil = ToPILImage()
+
+# Decode first frame (I-frame)
+frame_type, strings, shape = encoded_data[0]
+assert frame_type == 'I'
+with torch.no_grad():
+    x_hat = i_net.decompress(strings, shape)['x_hat'].clip_(0, 1)
+frame = np.array(to_pil(x_hat.squeeze(0).cpu()))
+frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+out.write(frame)
+
+# Decode remaining frames (P-frames)
+for frame_type, strings, shape in encoded_data[1:]:
+    assert frame_type == 'P'
+    with torch.no_grad():
+        dec_out = p_net.decompress(x_hat, strings, shape)
+    x_hat = dec_out['x_hat'].clip_(0, 1)
+    frame = np.array(to_pil(x_hat.squeeze(0).cpu()))
+    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    out.write(frame)
+
+out.release()
+print(f"Reconstructed video saved to {reconstructed_path}")
