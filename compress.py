@@ -13,7 +13,6 @@ input_video = "original.mp4"  # Input video file
 frames_dir = "frames"  # Directory for extracted frames
 compressed_dir = "compressed"  # Directory for reconstructed frames
 output_video = "compressed_video.mp4"
-fps = 30  # Adjust if your video has a different framerate
 target_width = None  # Set to an int to downscale width, or None to keep original
 
 os.makedirs(frames_dir, exist_ok=True)
@@ -21,6 +20,18 @@ os.makedirs(compressed_dir, exist_ok=True)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
+
+# =============================
+# 1a. Auto-detect video info
+# =============================
+probe = ffmpeg.probe(input_video)
+video_info = next(s for s in probe['streams'] if s['codec_type'] == 'video')
+fps_str = video_info['r_frame_rate']  # e.g. "30000/1001"
+num, den = map(int, fps_str.split('/'))
+fps = num / den
+width = int(video_info['width'])
+height = int(video_info['height'])
+print(f"Video info - FPS: {fps}, Width: {width}, Height: {height}")
 
 # =============================
 # 2. Extract frames using ffmpeg
