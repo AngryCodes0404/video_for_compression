@@ -153,7 +153,7 @@ for batch_idx in range(0, len(frame_files), batch_size):
     with torch.no_grad():
         # Use mixed precision for faster computation
         if device == "cuda":
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast("cuda"):
                 for idx, x_padded in enumerate(batch_tensor):
                     stream = streams[idx % len(streams)]
                     
