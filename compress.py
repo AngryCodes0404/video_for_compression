@@ -1,109 +1,127 @@
-import torch
-import cv2
-from torchvision.transforms import ToTensor, ToPILImage
-from compressai.zoo import bmshj2018_factorized, ssf2020
-import pickle
-import numpy as np
 import os
+import ffmpeg
+import torch
+import torch.nn.functional as F
+from PIL import Image
+from torchvision import transforms
+from compressai.zoo import cheng2020_attn
 
-# Device setup
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# =============================
+# 1. Setup
+# =============================
+input_video = "original.mp4"  # Input video file
+frames_dir = "frames"  # Directory for extracted frames
+compressed_dir = "compressed"  # Directory for reconstructed frames
+output_video = "compressed_video.mp4"
+fps = 30  # Adjust if your video has a different framerate
+target_width = None  # Set to an int to downscale width, or None to keep original
 
-# Load models (adjust quality: 1-8, lower = more compression)
-quality = 4
-i_net = bmshj2018_factorized(quality=quality, pretrained=True).to(device).eval()
-p_net = ssf2020(quality=quality, metric='mse', pretrained=True).to(device).eval()
+os.makedirs(frames_dir, exist_ok=True)
+os.makedirs(compressed_dir, exist_ok=True)
 
-# Input video path
-input_path = 'original.mp4'
-compressed_path = 'compressed.bin'
-reconstructed_path = 'reconstructed.mp4'
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {device}")
 
-# ====================
-# Encoding Section
-# ====================
-cap = cv2.VideoCapture(input_path)
-if not cap.isOpened():
-    raise ValueError("Unable to open video file")
+# =============================
+# 2. Extract frames using ffmpeg
+# =============================
+print("Extracting frames...")
+(
+    ffmpeg.input(input_video)
+    .output(os.path.join(frames_dir, "frame_%04d.png"))
+    .run(overwrite_output=True)
+)
+print("Frames extracted successfully.")
 
-# List to hold encoded data: [('I' or 'P', strings, shape)]
-encoded_data = []
+# =============================
+# 3. Load CompressAI model
+# =============================
+print("Loading compression model...")
+model = cheng2020_attn(quality=1, pretrained=True).eval().to(device)  # max compression
+to_tensor = transforms.ToTensor()
+to_pil = transforms.ToPILImage()
 
-# Read first frame (I-frame)
-ret, frame = cap.read()
-if not ret:
-    raise ValueError("Video has no frames")
-frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-x = ToTensor()(frame).unsqueeze(0).to(device)
+# =============================
+# 4. Compress and reconstruct frames in batches
+# =============================
+print("Compressing and reconstructing frames in batches...")
+batch_size = 16  # Adjust depending on VRAM; RTX 5090 can likely handle 16-32+
+frame_files = sorted([f for f in os.listdir(frames_dir) if f.endswith(".png")])
 
-with torch.no_grad():
-    compressed = i_net.compress(x)
-encoded_data.append(('I', compressed['strings'], compressed['shape']))
+for i in range(0, len(frame_files), batch_size):
+    batch_files = frame_files[i : i + batch_size]
+    imgs = []
+    orig_sizes = []
 
-# Get reconstructed for next frame
-with torch.no_grad():
-    x_hat = i_net.decompress(compressed['strings'], compressed['shape'])['x_hat'].clip_(0, 1)
+    # Load frames and store original sizes
+    max_h, max_w = 0, 0
+    for frame_file in batch_files:
+        img = Image.open(os.path.join(frames_dir, frame_file)).convert("RGB")
 
-# Process remaining frames (P-frames)
-frame_count = 1
-while cap.isOpened():
-    ret, frame = cap.read()
-    if not ret:
-        break
-    frame_count += 1
-    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    x = ToTensor()(frame).unsqueeze(0).to(device)
+        # Optional downscale
+        if target_width is not None:
+            w_percent = target_width / img.width
+            new_h = int(img.height * w_percent)
+            img = img.resize((target_width, new_h), Image.LANCZOS)
 
+        x = to_tensor(img)
+        h, w = x.size(1), x.size(2)
+        orig_sizes.append((h, w))
+        max_h = max(max_h, h)
+        max_w = max(max_w, w)
+        imgs.append(x)
+
+    # Pad frames to multiple of 64
+    padded_imgs = []
+    for x, (h, w) in zip(imgs, orig_sizes):
+        new_h = (max_h + 63) // 64 * 64
+        new_w = (max_w + 63) // 64 * 64
+        pad_h = new_h - h
+        pad_w = new_w - w
+        x_padded = F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
+        padded_imgs.append(x_padded)
+
+    batch_tensor = torch.stack(padded_imgs).to(device)
+
+    # Compress and reconstruct batch
     with torch.no_grad():
-        compressed = p_net.compress(x_hat, x)
-    encoded_data.append(('P', compressed['strings'], compressed['shape']))
+        compressed_batch = []
+        for x_padded in batch_tensor:
+            out = model.compress(x_padded.unsqueeze(0))
+            recon = model.decompress(out["strings"], out["shape"])
+            x_hat = recon["x_hat"].clamp(0, 1)
+            compressed_batch.append(x_hat.squeeze(0))
 
-    # Update x_hat for next
-    with torch.no_grad():
-        x_hat = p_net.decompress(x_hat, compressed['strings'], compressed['shape'])['x_hat'].clip_(0, 1)
+    # Crop to original size and save
+    for x_hat, (h, w), frame_file in zip(compressed_batch, orig_sizes, batch_files):
+        x_hat_cropped = x_hat[:, :h, :w]
+        to_pil(x_hat_cropped.cpu()).save(os.path.join(compressed_dir, frame_file))
 
-# Save compressed data
-with open(compressed_path, 'wb') as f:
-    pickle.dump(encoded_data, f)
-print(f"Compressed bitstream saved to {compressed_path} (size: {os.path.getsize(compressed_path)} bytes)")
+print("All frames compressed successfully in batches.")
 
-cap.release()
+# =============================
+# 5. Recombine frames into video
+# =============================
+print("Reassembling compressed frames into video...")
 
-# ====================
-# Decoding Section
-# ====================
-with open(compressed_path, 'rb') as f:
-    encoded_data = pickle.load(f)
+ffmpeg_input = ffmpeg.input(
+    os.path.join(compressed_dir, "frame_%04d.png"), framerate=fps
+)
+ffmpeg_output_args = {
+    "vcodec": "libx265",
+    "crf": 18,
+    "preset": "slow",
+    "pix_fmt": "yuv420p",
+}
+(ffmpeg_input.output(output_video, **ffmpeg_output_args).run(overwrite_output=True))
+print(f"✅ Compressed video saved as {output_video}")
 
-# Get video properties from original (for output)
-cap = cv2.VideoCapture(input_path)
-fps = cap.get(cv2.CAP_PROP_FPS)
-width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-cap.release()
+# =============================
+# 6. Optional cleanup
+# =============================
+# Uncomment to remove temporary frames
+# import shutil
+# shutil.rmtree(frames_dir)
+# shutil.rmtree(compressed_dir)
 
-out = cv2.VideoWriter(reconstructed_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
-
-to_pil = ToPILImage()
-
-# Decode first frame (I-frame)
-frame_type, strings, shape = encoded_data[0]
-assert frame_type == 'I'
-with torch.no_grad():
-    x_hat = i_net.decompress(strings, shape)['x_hat'].clip_(0, 1)
-frame = np.array(to_pil(x_hat.squeeze(0).cpu()))
-frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-out.write(frame)
-
-# Decode remaining frames (P-frames)
-for frame_type, strings, shape in encoded_data[1:]:
-    assert frame_type == 'P'
-    with torch.no_grad():
-        dec_out = p_net.decompress(x_hat, strings, shape)
-    x_hat = dec_out['x_hat'].clip_(0, 1)
-    frame = np.array(to_pil(x_hat.squeeze(0).cpu()))
-    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-    out.write(frame)
-
-out.release()
-print(f"Reconstructed video saved to {reconstructed_path}")
+print("Done!")
